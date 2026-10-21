@@ -99,3 +99,31 @@ class OperationInProgressError(Exception):
 
     Wait for it to finish or stop it with `StageController.Stop` or `AutofocusController.Stop`, then retry.
     """
+
+
+class TravelLimitExceededError(Exception):
+    """
+    The requested move or autofocus sweep would leave the travel limits, or the limits cannot be checked for it.
+
+    No move was sent to the microscope. Choose a target inside the limits reported by `StageController.TravelLimits`,
+    or change the stage_*_min/stage_*_max settings in config.json. On a delta stage that corrects backlash the limits
+    cannot be checked; the message says what to change.
+    """
+
+
+class ZeroPositionBlockedError(Exception):
+    """
+    Setting a new zero position is blocked while travel limits are configured.
+
+    The limits are positions in the stage's current coordinates, so zeroing would silently shift the protected range.
+    Remove or update the stage_*_min/stage_*_max settings in config.json and restart the connector first.
+    """
+
+
+class ExportFailedError(Exception):
+    """
+    The capture could not be saved as a file on the computer running the connector.
+
+    Check that the export folder reported by `CaptureStorageService.ExportFolder` exists or can be created, is
+    writable and has free space, or change export_folder in config.json.
+    """

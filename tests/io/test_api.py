@@ -36,6 +36,7 @@ DEVICE_CONTRACT = {
     "acquire_image",
     "capture_to_storage",
     "list_captures",
+    "get_capture",
     "download_capture",
     "read_capture_metadata",
     "set_capture_tags",

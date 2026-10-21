@@ -1,5 +1,7 @@
 """Every device endpoint declares the transport error, so an unplugged microscope is a *defined* SiLA error."""
 
+import pathlib
+
 import pytest
 
 from unitelabs.openflexure_microscope.features import (
@@ -12,7 +14,7 @@ from unitelabs.openflexure_microscope.features import (
 )
 
 
-LOCAL_ONLY = {"MJPEGStreamURL", "APIBaseURL", "Reachable"}
+LOCAL_ONLY = {"MJPEGStreamURL", "APIBaseURL", "Reachable", "TravelLimits", "ExportFolder"}
 """Endpoints that answer from local state or swallow transport errors by design."""
 
 
@@ -28,7 +30,11 @@ LOCAL_ONLY = {"MJPEGStreamURL", "APIBaseURL", "Reachable"}
     ],
 )
 def test_every_endpoint_declares_microscope_unreachable(api, feature_cls):
-    feature = feature_cls(api)
+    feature = (
+        feature_cls(api, export_folder=pathlib.Path("unused"))
+        if feature_cls is CaptureStorageService
+        else feature_cls(api)
+    )
     feature.attach()
     handlers = {**feature.commands, **feature.properties}
     assert handlers

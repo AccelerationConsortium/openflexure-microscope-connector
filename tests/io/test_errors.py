@@ -16,6 +16,9 @@ ALL_ERRORS = [
     errors.AutofocusUnavailableError,
     errors.AutofocusFailedError,
     errors.OperationInProgressError,
+    errors.TravelLimitExceededError,
+    errors.ExportFailedError,
+    errors.ZeroPositionBlockedError,
 ]
 
 

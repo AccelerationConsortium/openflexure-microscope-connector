@@ -11,4 +11,11 @@ services:
         source: ./config.json
         target: /app/config.json
         read_only: true
+      # ExportCapture saves to ~/Downloads/OpenFlexure by default, which is /root/Downloads/OpenFlexure in the
+      # container. Mounting it keeps exported images in ./exports on the host when the container is rebuilt.
+      - type: bind
+        source: ./exports
+        target: /root/Downloads/OpenFlexure
+        bind:
+          create_host_path: true
     command: ["connector", "start", "--app", "unitelabs.openflexure_microscope:create_app", "-cfg", "/app/config.json"]

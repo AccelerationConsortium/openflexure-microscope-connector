@@ -12,7 +12,7 @@
       "project_description": "A SiLA 2 connector for the OpenFlexure Microscope built with the UniteLabs CDK.",
       "author_full_name": "Acceleration Consortium",
       "author_email": "developers@accelerationconsortium.ca",
-      "project_repo": "https://github.com/AccelerationConsortium/openflexure-microscope",
+      "project_repo": "https://github.com/AccelerationConsortium/openflexure-microscope-connector",
       "communication_type": "none",
       "env": "uv",
       "_render_devdocs": false,

@@ -23,7 +23,7 @@ def test_feature_metadata(feature):
     assert feature.category == "microscopy"
     assert feature.attach() is True
     assert set(feature.commands) == {"MoveTo", "MoveBy", "SetZeroPosition", "Stop"}
-    assert set(feature.properties) == {"Position", "LivePosition", "StageType", "Backlash"}
+    assert set(feature.properties) == {"Position", "LivePosition", "StageType", "Backlash", "TravelLimits"}
     assert feature.commands["MoveTo"].observable is True
     assert feature.commands["MoveBy"].observable is True
     assert feature.commands["MoveTo"].execution_mode == sila.ExecutionMode.SINGLE
@@ -101,6 +101,30 @@ async def test_missing_stage_errors_surface_as_defined_errors(status, intermedia
 def test_declared_errors_cover_the_io_errors(feature):
     feature.attach()
     move_errors = {e.identifier for e in feature.commands["MoveTo"].errors.values()}
-    assert move_errors == {"StageUnavailableError", "StageBusyError", "MoveFailedError", "MicroscopeUnreachableError"}
+    assert move_errors == {
+        "StageUnavailableError",
+        "StageBusyError",
+        "MoveFailedError",
+        "MicroscopeUnreachableError",
+        "TravelLimitExceededError",
+    }
     zero_errors = {e.identifier for e in feature.commands["SetZeroPosition"].errors.values()}
+    assert "ZeroPositionBlockedError" in zero_errors
+    zero_errors.discard("ZeroPositionBlockedError")
     assert zero_errors == {"StageUnavailableError", "StageBusyError", "MoveFailedError", "MicroscopeUnreachableError"}
+
+
+async def test_travel_limits_property_and_refusal(status, intermediate):
+    from unitelabs.openflexure_microscope.io.limits import TravelLimits
+
+    api = make_api()
+    api.travel_limits = TravelLimits(z=(0, 100))
+    feature = StageController(api)
+    assert await feature.get_travel_limits() == [types.AxisLimit(axis=types.StageAxis.Z, minimum=0, maximum=100)]
+    with pytest.raises(errors.TravelLimitExceededError):
+        await feature.move_to(0, 0, 101, status=status, intermediate=intermediate)
+    assert await feature.get_position() == types.StagePosition(0, 0, 0)
+
+
+async def test_travel_limits_property_is_empty_without_limits(feature):
+    assert await feature.get_travel_limits() == []

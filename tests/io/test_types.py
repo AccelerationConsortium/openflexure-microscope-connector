@@ -98,6 +98,7 @@ def test_capture_info_from_v2_capture_dict():
         time="2026-10-20T12:00:00",
         format="jpeg",
         tags=["docs"],
+        annotations=[types.Annotation(key="Client", value="SwaggerUI")],
     )
 
 
@@ -107,6 +108,15 @@ def test_capture_info_tolerates_missing_optional_fields():
     assert info.time == ""
     assert info.format == ""
     assert info.tags == []
+    assert info.annotations == []
+
+
+def test_capture_info_ignores_malformed_tags_and_annotations():
+    info = types.CaptureInfo.from_mapping({"id": "1", "name": "a.jpeg", "tags": "abc", "annotations": ["x"]})
+    assert info.tags == []
+    assert info.annotations == []
+    info = types.CaptureInfo.from_mapping({"id": "1", "name": "a.jpeg", "annotations": {"sample": 7}})
+    assert info.annotations == [types.Annotation(key="sample", value="7")]
 
 
 def test_dataclasses_are_plain_dataclasses_for_sila_structures():
@@ -118,6 +128,8 @@ def test_dataclasses_are_plain_dataclasses_for_sila_structures():
         types.CaptureInfo,
         types.SharpnessSample,
         types.ServerInfo,
+        types.Annotation,
+        types.AxisLimit,
     ):
         assert dataclasses.is_dataclass(cls)
         assert cls.__doc__ and "Attributes:" in cls.__doc__

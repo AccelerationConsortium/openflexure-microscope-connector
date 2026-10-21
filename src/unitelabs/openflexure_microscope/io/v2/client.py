@@ -8,6 +8,7 @@ Long-running server calls are LabThings *actions*: `POST` returns the finished a
 import asyncio
 import collections.abc
 import contextlib
+import dataclasses
 import json as _json
 import logging
 import typing
@@ -26,7 +27,10 @@ from ..errors import (
     OperationInProgressError,
     StageBusyError,
     StageUnavailableError,
+    TravelLimitExceededError,
+    ZeroPositionBlockedError,
 )
+from ..limits import TravelLimits
 from ..types import (
     Backlash,
     CameraType,
@@ -51,8 +55,40 @@ log = logging.getLogger(__name__)
 
 _RUNNING = ("pending", "running")
 _PICAMERA = "camera/picamera"
+# The v2 autofocus extension runs its slow sweep with the stage backlash forced to 256 steps, whatever the settings
+# say (`set_properties(stage, backlash=256)`), so its moves down can overshoot by that much. Source:
+# https://gitlab.com/openflexure/openflexure-microscope-server/-/blob/v2.11.0/openflexure_microscope/api/default_extensions/autofocus.py
+_SLOW_AUTOFOCUS_BACKLASH = 256
+# While travel limits are set, how long a stage operation waits for this client's earlier ones to finish before it is
+# refused; the same as the server's own stage lock timeout.
+_MOTION_WAIT_S = 1.0
+_MOTION_WAIT_STEP_S = 0.02
+# How long Stop waits for the operations it stopped to end, so that the same command can be sent again right away.
+_STOP_SETTLE_S = 2.0
+# Failed status checks in a row after which the client gives up on a running action (and cancels it).
+_POLL_ATTEMPTS = 3
+_DELTA_BACKLASH = (
+    "Travel limits cannot be checked for this {what} on a delta stage while it corrects backlash: a delta stage "
+    "corrects backlash per motor, so its overshoot in x, y and z is not known. {remedy}"
+)
 
 HttpBackendFactory = collections.abc.Callable[[str, float], Backend]
+
+
+@dataclasses.dataclass(eq=False)
+class _Operation:
+    """A stage operation of one client, from its start until it ends (see `V2Client._operation`)."""
+
+    error: type[Exception]
+    what: str
+    stopped: bool = False
+    action_id: str | None = None
+
+    def check(self) -> None:
+        """Fail with the operation's error if Stop has stopped it."""
+        if self.stopped:
+            msg = f"{self.what} was stopped before it started."
+            raise self.error(msg)
 
 
 def _default_http_backend_factory(base_url: str, timeout_s: float) -> Backend:
@@ -120,8 +156,15 @@ class V2Client(MicroscopeApi):
         action_poll_interval_s: float = 0.25,
         simulated_backend: SimulatedBackend | None = None,
         http_backend_factory: HttpBackendFactory | None = None,
+        travel_limits: TravelLimits | None = None,
     ) -> None:
         self.real_base_url = real_base_url.rstrip("/")
+        self.travel_limits = travel_limits or TravelLimits()
+        self._motion_lock = asyncio.Lock()
+        self._motion_queue: collections.deque[_Operation] = collections.deque()  # waiting for the lock, in order
+        self._operations: set[_Operation] = set()  # stage operations running now
+        self._cancelled_actions: set[str] = set()  # actions abort_actions has cancelled and that still run
+        self._wake = asyncio.Event()  # set by abort_actions to end the poll loops' pause early
         self._request_timeout_s = request_timeout_s
         self._action_poll_interval_s = action_poll_interval_s
         self._simulated_backend = simulated_backend or SimulatedBackend()
@@ -136,11 +179,20 @@ class V2Client(MicroscopeApi):
     @classmethod
     def from_config(cls, config: "OpenflexureMicroscopeConfig") -> "V2Client":
         """Create a client from the connector configuration."""
+        limits = TravelLimits.from_bounds(
+            x_min=config.stage_x_min,
+            x_max=config.stage_x_max,
+            y_min=config.stage_y_min,
+            y_max=config.stage_y_max,
+            z_min=config.stage_z_min,
+            z_max=config.stage_z_max,
+        )
         return cls(
             real_base_url=f"http://{config.host}:{config.port}/api/v2",
             simulated=config.simulation_mode,
             request_timeout_s=config.request_timeout_s,
             action_poll_interval_s=config.action_poll_interval_s,
+            travel_limits=limits,
         )
 
     # -- lifecycle -----------------------------------------------------------------------------------------------
@@ -272,19 +324,102 @@ class V2Client(MicroscopeApi):
         absolute: bool,
         on_progress: ProgressCallback | None = None,
     ) -> StagePosition:
-        """Move the stage through the `stage/move` action."""
-        await self._require_stage()
-        action = await self._run_action(
-            "/actions/stage/move/",
-            {"x": int(x), "y": int(y), "z": int(z), "absolute": bool(absolute)},
-            on_progress,
-            failure=MoveFailedError,
-            busy=StageBusyError,
-        )
+        """Move the stage through the `stage/move` action, after checking the travel limits."""
+        body: dict[str, int | bool] = {"x": int(x), "y": int(y), "z": int(z), "absolute": bool(absolute)}
+        with self._operation(MoveFailedError, "The move") as operation:
+            async with self._limited_motion(operation):
+                if self.travel_limits.enabled:
+                    body = await self._checked_move(int(x), int(y), int(z), absolute=absolute)
+                await self._require_stage()
+                operation.check()
+                action = await self._run_action(
+                    "/actions/stage/move/",
+                    body,
+                    on_progress,
+                    failure=MoveFailedError,
+                    busy=StageBusyError,
+                    operation=operation,
+                )
         return StagePosition.from_mapping(action["output"])
 
+    async def _checked_move(self, x: int, y: int, z: int, *, absolute: bool) -> dict[str, int | bool]:
+        """Check a move against the travel limits and return the request body to send for it."""
+        current = await self.get_position()
+        if absolute:
+            target = StagePosition(x=x, y=y, z=z)
+        else:
+            target = StagePosition(x=current.x + x, y=current.y + y, z=current.z + z)
+        moving = [axis for axis in "xyz" if getattr(target, axis) != getattr(current, axis)]
+        backlash = await self.get_backlash() if moving else None
+        if (
+            backlash is not None
+            and (backlash.x or backlash.y or backlash.z)
+            and await self._stage_type() is StageType.SANGA_DELTA_STAGE
+        ):
+            remedy = "Set the stage backlash to 0 on the microscope, or remove the stage_*_min/stage_*_max settings."
+            raise TravelLimitExceededError(_DELTA_BACKLASH.format(what="move", remedy=remedy))
+        self.travel_limits.check_move(current, target, backlash)
+        # Send only the axes that move, as absolute targets: the server turns each target into a relative move from
+        # the position it reads when the request arrives, so the end point stays inside the limits even if another
+        # client moved the stage after our read (once that move has finished), and the axes left out stay put. A move
+        # by another client that is still running is not covered (upstream reads the position before its stage lock).
+        return {**{axis: getattr(target, axis) for axis in moving}, "absolute": True}
+
+    @contextlib.contextmanager
+    def _operation(self, error: type[Exception], what: str) -> collections.abc.Iterator[_Operation]:
+        """
+        Track a stage operation from its start until it ends, so that Stop (`abort_actions`) can stop it at any point.
+
+        Stop marks it as stopped. Before its action is sent it then fails with `error` (`operation.check()`); once its
+        action runs, the action is cancelled on the microscope.
+        """
+        operation = _Operation(error, what)
+        self._operations.add(operation)
+        try:
+            yield operation
+        finally:
+            self._operations.discard(operation)
+
+    @contextlib.asynccontextmanager
+    async def _limited_motion(self, operation: _Operation) -> collections.abc.AsyncIterator[None]:
+        """
+        While travel limits are set, run this client's stage operations one at a time, in the order they arrive.
+
+        An operation waits up to `_MOTION_WAIT_S` for the ones before it and then fails with `StageBusyError`; one that
+        Stop stops while it waits fails at once.
+        """
+        if not self.travel_limits.enabled:
+            yield
+            return
+        # Poll in arrival order instead of `asyncio.wait_for(lock.acquire())`: before Python 3.12, wait_for can lose
+        # a lock it acquired when the waiting task is cancelled.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _MOTION_WAIT_S
+        self._motion_queue.append(operation)
+        try:
+            while self._motion_lock.locked() or self._motion_queue[0] is not operation:
+                operation.check()
+                if loop.time() >= deadline:
+                    msg = (
+                        "Another move or autofocus started through this connector is still running; wait for it to "
+                        "finish or call Stop. While travel limits are set, stage operations run one at a time."
+                    )
+                    raise StageBusyError(msg)
+                await asyncio.sleep(_MOTION_WAIT_STEP_S)
+        finally:
+            self._motion_queue.remove(operation)
+        operation.check()
+        async with self._motion_lock:  # free, and nothing can take it before this line: no await in between
+            yield
+
     async def set_zero_position(self) -> StagePosition:
-        """Reset the position readout to the origin through the `stage/zero` action."""
+        """Reset the position readout to the origin through the `stage/zero` action (blocked while limits are set)."""
+        if self.travel_limits.enabled:
+            msg = (
+                "Setting a new zero position is blocked while travel limits are configured, because it would shift "
+                "the protected range. Remove or update the stage_*_min/stage_*_max settings in config.json first."
+            )
+            raise ZeroPositionBlockedError(msg)
         await self._require_stage()
         action = await self._run_action("/actions/stage/zero/", {}, None, failure=MoveFailedError, busy=StageBusyError)
         output = action["output"] or {}
@@ -296,22 +431,57 @@ class V2Client(MicroscopeApi):
         return Backlash.from_mapping(response.json())
 
     async def abort_actions(self) -> int:
-        """Cancel (DELETE) every action this client is still polling and return how many were cancelled."""
-        cancelled = 0
+        """
+        Stop this client's stage operations and return how many were stopped.
+
+        An operation that has not sent its action yet (still reading the stage, or waiting for an earlier one) fails
+        instead of starting, and every action this client is still polling is cancelled (DELETE) on the microscope.
+        Then waits, at most `_STOP_SETTLE_S`, until the stopped operations have ended, so that the same command can
+        be sent again right away. An action counts only once the microscope has accepted its cancellation; one it
+        did not accept keeps running, stays tracked and is retried by the next Stop.
+        """
+        newly_stopped = [operation for operation in self._operations if not operation.stopped]
+        for operation in newly_stopped:
+            operation.stopped = True
+        # An operation that has not sent its action yet fails at its next check: it is stopped and will end.
+        ending = [operation for operation in newly_stopped if operation.action_id is None]
+        stopped = len(ending)
+        owners = {operation.action_id: operation for operation in self._operations if operation.action_id is not None}
         for action_id, href in list(self._active_actions.items()):
-            try:
-                response = await self._backend.request("DELETE", href)
-            except MicroscopeUnreachableError:
+            if action_id in self._cancelled_actions:
                 continue
-            if response.ok:
-                cancelled += 1
-            log.info("Cancelled server action %s (HTTP %s)", action_id, response.status_code)
-        return cancelled
+            self._cancelled_actions.add(action_id)
+            if not await self._cancel(href):
+                self._cancelled_actions.discard(action_id)
+                log.warning("The microscope did not cancel server action %s; it keeps running", action_id)
+                continue
+            log.info("Cancelled server action %s", action_id)
+            stopped += 1
+            if (owner := owners.get(action_id)) is not None:
+                ending.append(owner)
+        self._wake.set()  # end the poll loops' pause, so that they see the cancellation now
+        self._wake = asyncio.Event()
+        deadline = asyncio.get_running_loop().time() + _STOP_SETTLE_S
+        while any(operation in self._operations for operation in ending):
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(_MOTION_WAIT_STEP_S)
+        return stopped
+
+    async def _cancel(self, href: str) -> bool:
+        """Ask the microscope to cancel an action; return whether it accepted."""
+        try:
+            response = await self._backend.request("DELETE", href)
+        except MicroscopeUnreachableError:
+            return False
+        return response.ok
+
+    async def _stage_type(self) -> StageType:
+        configuration = (await self._get("/instrument/configuration", StageUnavailableError)).json()
+        return StageType(str(configuration.get("stage", {}).get("type", "")))
 
     async def _require_stage(self) -> None:
-        configuration = (await self._get("/instrument/configuration", StageUnavailableError)).json()
-        stage_type = str(configuration.get("stage", {}).get("type", ""))
-        if StageType(stage_type) is StageType.MISSING_STAGE:
+        if await self._stage_type() is StageType.MISSING_STAGE:
             msg = (
                 "The OpenFlexure server reports no stage (MissingStage); "
                 "check the Sangaboard connection and restart the server."
@@ -503,6 +673,8 @@ class V2Client(MicroscopeApi):
         tags: collections.abc.Sequence[str],
         resolution: CaptureResolution,
         on_progress: ProgressCallback | None = None,
+        *,
+        annotations: collections.abc.Mapping[str, str] | None = None,
     ) -> CaptureInfo:
         """Run the `camera/capture` action and describe the stored capture."""
         await self._require_camera()
@@ -510,7 +682,7 @@ class V2Client(MicroscopeApi):
             "use_video_port": resolution.use_video_port,
             "bayer": False,
             "tags": [str(tag) for tag in tags],
-            "annotations": {},
+            "annotations": {str(key): str(value) for key, value in (annotations or {}).items()},
             "temporary": False,
         }
         if filename:
@@ -535,13 +707,26 @@ class V2Client(MicroscopeApi):
         response = await self._get("/captures", CaptureFailedError)
         return [CaptureInfo.from_mapping(item) for item in response.json()]
 
+    async def get_capture(self, capture_id: str) -> CaptureInfo:
+        """Describe one stored capture."""
+        return CaptureInfo.from_mapping(await self._capture(capture_id))
+
     async def download_capture(self, capture_id: str, *, thumbnail: bool = False) -> bytes:
         """Download a capture by looking up its file name, then fetching `/download/{name}`."""
         capture = await self._capture(capture_id)
+        name = str(capture["name"])
+        try:
+            quoted = urllib.parse.quote(name, safe="")
+        except UnicodeEncodeError as exc:
+            msg = (
+                f"Capture {capture_id!r} has a file name that cannot be sent to the microscope ({name!r}); "
+                "rename or re-save it on the microscope."
+            )
+            raise CaptureFailedError(msg) from exc
         params = {"thumbnail": "true"} if thumbnail else None
         response = await self._backend.request(
             "GET",
-            self._capture_path(capture_id, f"/download/{urllib.parse.quote(str(capture['name']), safe='')}"),
+            self._capture_path(capture_id, f"/download/{quoted}"),
             params=params,
             headers={"Accept": "image/jpeg"},
         )
@@ -601,11 +786,24 @@ class V2Client(MicroscopeApi):
 
     async def fast_autofocus(self, z_range: int, on_progress: ProgressCallback | None = None) -> StagePosition:
         """Run the extension's `fast_autofocus` action and return the resulting position."""
-        await self._require_stage()
-        href = await self._autofocus_link("fast_autofocus")
-        await self._run_action(
-            href, {"dz": int(z_range)}, on_progress, failure=AutofocusFailedError, busy=StageBusyError
-        )
+        with self._operation(AutofocusFailedError, "The autofocus") as operation:
+            async with self._limited_motion(operation):
+                if self.travel_limits.z is not None:
+                    z = (await self.get_position()).z
+                    # The fast autofocus searches z_range centred on the current z, with backlash correction off.
+                    half = (abs(int(z_range)) + 1) // 2
+                    self.travel_limits.check_z_range(z - half, z + half)
+                await self._require_stage()
+                href = await self._autofocus_link("fast_autofocus")
+                operation.check()
+                await self._run_action(
+                    href,
+                    {"dz": int(z_range)},
+                    on_progress,
+                    failure=AutofocusFailedError,
+                    busy=StageBusyError,
+                    operation=operation,
+                )
         return await self.get_position()
 
     async def autofocus_sweep(
@@ -614,15 +812,27 @@ class V2Client(MicroscopeApi):
         on_progress: ProgressCallback | None = None,
     ) -> list[SharpnessSample]:
         """Run the extension's slow `autofocus` action and return its (positions, sharpnesses) output as samples."""
-        await self._require_stage()
-        href = await self._autofocus_link("autofocus")
-        action = await self._run_action(
-            href,
-            {"dz": [int(offset) for offset in z_offsets]},
-            on_progress,
-            failure=AutofocusFailedError,
-            busy=StageBusyError,
-        )
+        with self._operation(AutofocusFailedError, "The autofocus") as operation:
+            async with self._limited_motion(operation):
+                if self.travel_limits.z is not None and z_offsets:
+                    if await self._stage_type() is StageType.SANGA_DELTA_STAGE:
+                        remedy = "Use RunFastAutofocus, which corrects no backlash, or remove the z travel limits."
+                        raise TravelLimitExceededError(_DELTA_BACKLASH.format(what="autofocus", remedy=remedy))
+                    z = (await self.get_position()).z
+                    self.travel_limits.check_z_range(
+                        z + min(z_offsets), z + max(z_offsets), backlash=_SLOW_AUTOFOCUS_BACKLASH
+                    )
+                await self._require_stage()
+                href = await self._autofocus_link("autofocus")
+                operation.check()
+                action = await self._run_action(
+                    href,
+                    {"dz": [int(offset) for offset in z_offsets]},
+                    on_progress,
+                    failure=AutofocusFailedError,
+                    busy=StageBusyError,
+                    operation=operation,
+                )
         try:
             positions, sharpnesses = action["output"]
         except (TypeError, ValueError):
@@ -682,13 +892,22 @@ class V2Client(MicroscopeApi):
         *,
         failure: type[Exception],
         busy: type[Exception] | None = None,
+        operation: _Operation | None = None,
     ) -> dict[str, typing.Any]:
         """POST an action, poll it to completion (cancelling server-side on `CancelledError`) and return it."""
         response = await self._backend.request("POST", path, json=body)
         if not response.ok:
             msg = f"The server rejected the action POST {path} ({_describe(response)})."
             raise failure(msg)
-        return await self._await_action(response.json(), on_progress, failure=failure, busy=busy)
+        action = response.json()
+        if operation is not None and operation.stopped and action.get("status") in _RUNNING:
+            # Stop came while the request was on its way: cancel the action the microscope has just started. If the
+            # microscope does not accept that, keep tracking the action below, so that a later Stop can retry.
+            href = str(action.get("links", {}).get("self", {}).get("href", ""))
+            if href and await self._cancel(href):
+                msg = f"{operation.what} was stopped as it started."
+                raise operation.error(msg)
+        return await self._await_action(action, on_progress, failure=failure, busy=busy, operation=operation)
 
     async def _await_action(
         self,
@@ -697,29 +916,49 @@ class V2Client(MicroscopeApi):
         *,
         failure: type[Exception],
         busy: type[Exception] | None,
+        operation: _Operation | None = None,
     ) -> dict[str, typing.Any]:
-        """Poll an Action until it leaves pending/running; cancel it server-side if this coroutine is cancelled."""
+        """
+        Poll an Action until it leaves pending/running and return it.
+
+        A failed status check is retried; after `_POLL_ATTEMPTS` failures in a row, or if this coroutine is cancelled,
+        the action is cancelled on the microscope (best effort) rather than left running untracked.
+        """
         self._report(on_progress, action)
         action_id = str(action.get("id", ""))
         href = str(action.get("links", {}).get("self", {}).get("href", ""))
         if action.get("status") in _RUNNING and action_id and href:
             self._active_actions[action_id] = href
+            if operation is not None:
+                operation.action_id = action_id
 
+        failed_polls = 0
         try:
             while action.get("status") in _RUNNING:
-                await asyncio.sleep(self._action_poll_interval_s)
-                poll = await self._backend.request("GET", href)
+                await self._pause()
+                try:
+                    poll = await self._backend.request("GET", href)
+                except MicroscopeUnreachableError:
+                    failed_polls += 1
+                    if failed_polls >= _POLL_ATTEMPTS:
+                        raise
+                    continue
                 if not poll.ok:
-                    msg = f"Polling action {action_id} failed ({_describe(poll)})."
-                    raise failure(msg)
+                    failed_polls += 1
+                    if failed_polls >= _POLL_ATTEMPTS:
+                        msg = f"Polling action {action_id} failed ({_describe(poll)})."
+                        raise failure(msg)
+                    continue
+                failed_polls = 0
                 action = poll.json()
                 self._report(on_progress, action)
-        except asyncio.CancelledError:
+        except BaseException:
             with contextlib.suppress(Exception):
                 await self._backend.request("DELETE", href)
             raise
         finally:
             self._active_actions.pop(action_id, None)
+            self._cancelled_actions.discard(action_id)
 
         status = action.get("status")
         if status == "completed":
@@ -733,6 +972,14 @@ class V2Client(MicroscopeApi):
             raise busy(msg)
         msg = f"Server action '{action.get('action', action_id)}' ended with status '{status}': {message}"
         raise failure(msg)
+
+    async def _pause(self) -> None:
+        """Wait one poll interval, or less if Stop wakes the poll loops."""
+        waiter = asyncio.ensure_future(self._wake.wait())
+        try:
+            await asyncio.wait({waiter}, timeout=self._action_poll_interval_s)
+        finally:
+            waiter.cancel()
 
     @staticmethod
     def _report(on_progress: ProgressCallback | None, action: collections.abc.Mapping[str, typing.Any]) -> None:

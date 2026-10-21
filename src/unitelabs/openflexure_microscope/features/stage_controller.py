@@ -6,14 +6,34 @@ import typing
 from unitelabs.cdk import sila
 
 from ..io.api import MicroscopeApi
-from ..io.errors import MicroscopeUnreachableError, MoveFailedError, StageBusyError, StageUnavailableError
-from ..io.types import Backlash, StagePosition, StageType
+from ..io.errors import (
+    MicroscopeUnreachableError,
+    MoveFailedError,
+    StageBusyError,
+    StageUnavailableError,
+    TravelLimitExceededError,
+    ZeroPositionBlockedError,
+)
+from ..io.types import AxisLimit, Backlash, StagePosition, StageType
 from ..io.units import STEP
 from ._common import CATEGORY, ORIGINATOR
 from ._progress import OperationProgress, run_observable
 
 Steps = typing.Annotated[int, STEP]
-_MOVE_ERRORS = (StageUnavailableError, StageBusyError, MoveFailedError, MicroscopeUnreachableError)
+_MOVE_ERRORS = (
+    StageUnavailableError,
+    StageBusyError,
+    MoveFailedError,
+    MicroscopeUnreachableError,
+    TravelLimitExceededError,
+)
+_ZERO_ERRORS = (
+    StageUnavailableError,
+    StageBusyError,
+    MoveFailedError,
+    MicroscopeUnreachableError,
+    ZeroPositionBlockedError,
+)
 _READ_ERRORS = (StageUnavailableError, MicroscopeUnreachableError)
 
 
@@ -27,6 +47,10 @@ class StageController(sila.Feature):
 
     Moves are observable commands. `StageController.Stop` cancels a running move on the microscope and, because
     autofocus also drives the stage, a running autofocus routine as well.
+
+    If travel limits are configured for the connector (see `StageController.TravelLimits`), moves that would leave
+    them are refused with `TravelLimitExceededError` before the stage moves. The limits are
+    positions in the stage's current coordinates, so `StageController.SetZeroPosition` is refused while they are set.
     """
 
     def __init__(self, api: MicroscopeApi, *, position_poll_interval_s: float = 0.5) -> None:
@@ -54,6 +78,11 @@ class StageController(sila.Feature):
     async def get_stage_type(self) -> StageType:
         """The kind of stage attached to the microscope."""
         return (await self._api.get_server_info()).stage_type
+
+    @sila.UnobservableProperty()
+    async def get_travel_limits(self) -> list[AxisLimit]:
+        """The range each limited axis must stay within; an empty list means moves are not limited."""
+        return self._api.travel_limits.as_axis_limits()
 
     @sila.UnobservableProperty(errors=_READ_ERRORS)
     async def get_backlash(self) -> Backlash:
@@ -126,7 +155,7 @@ class StageController(sila.Feature):
             action=lambda on_progress: self._api.move(x, y, z, absolute=False, on_progress=on_progress),
         )
 
-    @sila.UnobservableCommand(errors=_MOVE_ERRORS)
+    @sila.UnobservableCommand(errors=_ZERO_ERRORS)
     async def set_zero_position(self) -> StagePosition:
         """
         Make the current stage position the origin without moving.
@@ -141,10 +170,11 @@ class StageController(sila.Feature):
         """
         Stop the stage by cancelling every running move or autofocus action on the microscope.
 
-        The cancelled commands finish with a `MoveFailedError` or `AutofocusFailedError` that reports the
-        cancellation.
+        A move or autofocus that has not reached the microscope yet is stopped too. The stopped commands finish with
+        a `MoveFailedError` or `AutofocusFailedError` that reports it, and Stop returns once they have ended, so the
+        same command can be sent again right away.
 
         Returns:
-          StoppedOperations: How many running operations were cancelled.
+          StoppedOperations: How many operations were stopped.
         """
         return await self._api.abort_actions()

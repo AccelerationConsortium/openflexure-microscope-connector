@@ -7,7 +7,7 @@ from unitelabs.cdk.sila import constraints
 
 from ..io.api import MicroscopeApi
 from ..io.errors import CameraUnavailableError, CaptureFailedError, MicroscopeUnreachableError
-from ..io.types import CaptureInfo, CaptureResolution
+from ..io.types import Annotation, CaptureInfo, CaptureResolution
 from ._common import CATEGORY, ORIGINATOR
 from ._progress import OperationProgress, run_observable
 
@@ -79,6 +79,7 @@ class ImageAcquisitionController(sila.Feature):
         self,
         filename: str,
         tags: list[str],
+        annotations: list[Annotation],
         resolution: CaptureResolution,
         *,
         status: sila.Status,
@@ -90,6 +91,8 @@ class ImageAcquisitionController(sila.Feature):
         Args:
           Filename: File name for the capture without extension; leave empty to let the microscope use a timestamp.
           Tags: Tags to attach to the stored capture; may be empty.
+          Annotations: Key/value notes to store with the capture, e.g. a sample identifier; keys must be unique.
+            May be empty.
           Resolution: Whether to capture at the preview stream resolution or at the full still-image resolution.
 
         Yields:
@@ -105,6 +108,21 @@ class ImageAcquisitionController(sila.Feature):
             complete="Image stored on the microscope.",
             cancelled="Image capture cancelled.",
             action=lambda on_progress: self._api.capture_to_storage(
-                filename, tags, resolution, on_progress=on_progress
+                filename,
+                tags,
+                resolution,
+                on_progress=on_progress,
+                annotations={note.key: note.value for note in annotations},
             ),
         )
+
+    @capture_to_storage.validator
+    def _check_annotations(self, annotations: list[Annotation]) -> None:
+        keys = [note.key for note in annotations]
+        if any(not key.strip() for key in keys):
+            msg = "Annotation keys must not be empty."
+            raise sila.errors.ValidationError(msg, "annotations")
+        duplicates = sorted({key for key in keys if keys.count(key) > 1})
+        if duplicates:
+            msg = f"Annotation keys must be unique; duplicate keys: {', '.join(duplicates)}."
+            raise sila.errors.ValidationError(msg, "annotations")

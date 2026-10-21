@@ -44,8 +44,14 @@ async def test_acquire_image_full_and_preview(feature, backend, status, intermed
 
 async def test_capture_to_storage(feature, api, status, intermediate):
     info = await feature.capture_to_storage(
-        "sample", ["run-1"], types.CaptureResolution.PREVIEW, status=status, intermediate=intermediate
+        "sample",
+        ["run-1"],
+        [types.Annotation("sample", "S-1"), types.Annotation("step", "3")],
+        types.CaptureResolution.PREVIEW,
+        status=status,
+        intermediate=intermediate,
     )
+    assert info.annotations == [types.Annotation("sample", "S-1"), types.Annotation("step", "3")]
     assert isinstance(info, types.CaptureInfo)
     assert info.name == "sample.jpeg"
     assert info.tags == ["run-1"]
@@ -64,5 +70,18 @@ async def test_missing_camera_raises_defined_error(status, intermediate):
         await feature.acquire_image(types.CaptureResolution.FULL, status=status, intermediate=intermediate)
     with pytest.raises(errors.CameraUnavailableError):
         await feature.capture_to_storage(
-            "x", [], types.CaptureResolution.FULL, status=status, intermediate=intermediate
+            "x", [], [], types.CaptureResolution.FULL, status=status, intermediate=intermediate
         )
+
+
+@pytest.mark.parametrize(
+    ("annotations", "problem"),
+    [
+        ([types.Annotation("", "x")], "empty"),
+        ([types.Annotation("a", "1"), types.Annotation("a", "2")], "duplicate"),
+    ],
+)
+def test_annotation_keys_must_be_unique_and_non_empty(feature, annotations, problem):
+    with pytest.raises(sila.errors.ValidationError, match=problem):
+        feature._check_annotations(annotations)
+    feature._check_annotations([types.Annotation("a", "1"), types.Annotation("b", "")])

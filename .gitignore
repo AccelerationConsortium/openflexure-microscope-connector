@@ -233,3 +233,6 @@ logs/connector.log*
 *.jpeg
 junit.xml
 .uv-cache/
+
+# Images exported by the Docker container (docker-compose.yml)
+exports/
