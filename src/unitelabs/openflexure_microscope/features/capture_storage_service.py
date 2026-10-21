@@ -1,12 +1,14 @@
 """SiLA feature for the images stored on the OpenFlexure Microscope."""
 
+import pathlib
 import typing
 
 from unitelabs.cdk import sila
 from unitelabs.cdk.sila import constraints
 
 from ..io.api import Capability, MicroscopeApi
-from ..io.errors import CaptureFailedError, CaptureNotFoundError, MicroscopeUnreachableError
+from ..io.errors import CaptureFailedError, CaptureNotFoundError, ExportFailedError, MicroscopeUnreachableError
+from ..io.export import export_capture
 from ..io.types import CaptureInfo
 from ._common import CATEGORY, ORIGINATOR
 
@@ -20,17 +22,41 @@ class CaptureStorageService(sila.Feature):
     Browse, download, tag and delete the images stored on the OpenFlexure Microscope.
 
     Captures are created with `ImageAcquisitionController.CaptureToStorage` (or from the microscope's own web
-    interface) and addressed by the identifier reported in `Captures`.
+    interface) and addressed by the identifier reported in `Captures`. `CaptureStorageService.ExportCapture` saves a
+    capture as a file in `CaptureStorageService.ExportFolder` on the computer running the connector.
     """
 
-    def __init__(self, api: MicroscopeApi) -> None:
+    def __init__(self, api: MicroscopeApi, *, export_folder: pathlib.Path) -> None:
         super().__init__(originator=ORIGINATOR, category=CATEGORY)
         self._api = api
+        # A relative folder is taken relative to the folder the connector was started from.
+        self._export_folder = pathlib.Path(export_folder).expanduser().absolute()
 
     @sila.UnobservableProperty(errors=[CaptureFailedError, MicroscopeUnreachableError])
     async def get_captures(self) -> list[CaptureInfo]:
         """The captures currently stored on the microscope."""
         return await self._api.list_captures()
+
+    @sila.UnobservableProperty()
+    async def get_export_folder(self) -> str:
+        """The folder on the computer running the connector where `ExportCapture` saves images."""
+        return str(self._export_folder)
+
+    @sila.UnobservableCommand(errors=[*_CAPTURE_ERRORS, ExportFailedError])
+    async def export_capture(self, capture_id: str) -> str:
+        """
+        Save a stored capture as an image file in the export folder of the computer running the connector.
+
+        The file keeps the capture's name. If a file with that name already exists, a number is added instead of
+        overwriting it.
+
+        Args:
+          CaptureId: Identifier of the capture, as listed in `Captures`.
+
+        Returns:
+          SavedPath: Full path of the saved file.
+        """
+        return str(await export_capture(self._api, capture_id, self._export_folder))
 
     @sila.UnobservableCommand(errors=_CAPTURE_ERRORS)
     async def download_capture(self, capture_id: str) -> Jpeg:

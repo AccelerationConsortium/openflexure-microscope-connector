@@ -13,6 +13,7 @@ from ..io.errors import (
     MicroscopeUnreachableError,
     StageBusyError,
     StageUnavailableError,
+    TravelLimitExceededError,
 )
 from ..io.types import SharpnessSample, StagePosition
 from ..io.units import STEP
@@ -27,6 +28,7 @@ _AUTOFOCUS_ERRORS = (
     StageBusyError,
     StageUnavailableError,
     MicroscopeUnreachableError,
+    TravelLimitExceededError,
 )
 
 
@@ -120,9 +122,10 @@ class AutofocusController(sila.Feature):
         Stop a running autofocus routine by cancelling it on the microscope.
 
         The cancelled routine finishes with an `AutofocusFailedError` that reports the cancellation. Because the
-        routines drive the stage, this also stops a running `StageController` move.
+        routines drive the stage, this also stops a running `StageController` move, and a move or autofocus that has
+        not reached the microscope yet. Returns once the stopped commands have ended.
 
         Returns:
-          StoppedOperations: How many running operations were cancelled.
+          StoppedOperations: How many operations were stopped.
         """
         return await self._api.abort_actions()

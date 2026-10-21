@@ -284,5 +284,15 @@ async def create_app(config: DeviceConfig) -> collections.abc.AsyncGenerator[Con
   - `sila.client` `CommandExecution.get_responses()` does not wait; consume `subscribe_status()` first
     (`scripts/smoke_client.py::wait_for_responses`).
   - Full-resolution `AcquireImage` (~4.4 MiB JPEG) travels through SiLA binary transfer without changes.
+  - `POST /actions/camera/capture/` stores the `annotations` dict as sent and `GET /captures/{id}` returns it
+    unchanged (string values).
+  - Discovery (2026-10-21): with `discovery.network_interfaces` unset, unitelabs-sila sends mDNS through the OS's
+    default multicast interface. On the dev PC that was Tailscale (169.254.x) and, with Docker Desktop running, the
+    WSL vEthernet, never Wi-Fi, so only the local Ground Control saw the connector. `discovery.py` fills in the
+    reachable IPv4 addresses while `create_app` builds the `Connector` (the CDK reads the list once, in
+    `Discovery.__init__`) and restores `null` so `Config.dump()` never persists them.
+  - Scripts that start the connector in-process (not via the CLI) must run with `python -X utf8` on Windows when
+    output is piped: unconfigured structlog prints box-drawn tracebacks to cp1252 stdout, and the encode error
+    replaces every defined error with `UndefinedExecutionError`. The `connector start` CLI is not affected.
   - Not yet verified: stage moves, `Stop`, autofocus and the action error/busy shapes (the server reported
     `MissingStage`, so the connector refused those, as designed).

@@ -1,10 +1,12 @@
 import collections.abc
+import pathlib
 from importlib.metadata import version
 
 from unitelabs.cdk import Connector, get_logger
 from unitelabs.cdk.features.core.lock_controller import LockController
 
 from .config import OpenflexureMicroscopeConfig
+from .discovery import discovery_on_reachable_interfaces
 from .features import (
     AutofocusController,
     CameraController,
@@ -43,12 +45,13 @@ async def create_app(config: OpenflexureMicroscopeConfig) -> collections.abc.Asy
         if not config.simulation_mode:
             await api.open()
 
-        app = Connector(config)
+        with discovery_on_reachable_interfaces(config):
+            app = Connector(config)
         app.register(LockController())
         app.register(SimulationController(api))
         app.register(StageController(api, position_poll_interval_s=config.position_poll_interval_s))
         app.register(ImageAcquisitionController(api))
-        app.register(CaptureStorageService(api))
+        app.register(CaptureStorageService(api, export_folder=pathlib.Path(config.export_folder)))
         app.register(CameraController(api))
         app.register(AutofocusController(api))
         app.register(MicroscopeProvider(api))

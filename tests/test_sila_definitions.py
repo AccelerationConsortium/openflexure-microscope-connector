@@ -11,12 +11,19 @@ from unitelabs.openflexure_microscope.config import OpenflexureMicroscopeConfig
 DEVICE_FEATURES = {
     "StageController": (
         {"MoveTo", "MoveBy", "SetZeroPosition", "Stop"},
-        {"Position", "LivePosition", "StageType", "Backlash"},
+        {"Position", "LivePosition", "StageType", "Backlash", "TravelLimits"},
     ),
     "ImageAcquisitionController": ({"GrabPreviewFrame", "AcquireImage", "CaptureToStorage"}, {"MJPEGStreamURL"}),
     "CaptureStorageService": (
-        {"DownloadCapture", "DownloadThumbnail", "ReadCaptureMetadata", "SetCaptureTags", "DeleteCapture"},
-        {"Captures"},
+        {
+            "DownloadCapture",
+            "DownloadThumbnail",
+            "ReadCaptureMetadata",
+            "SetCaptureTags",
+            "DeleteCapture",
+            "ExportCapture",
+        },
+        {"Captures", "ExportFolder"},
     ),
     "CameraController": (
         {

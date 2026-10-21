@@ -11,6 +11,8 @@ import enum
 import logging
 import typing
 
+from unitelabs.cdk.sila import constraints
+
 from .units import PIXEL, STEP
 
 log = logging.getLogger(__name__)
@@ -92,6 +94,44 @@ class WhiteBalanceGains:
     blue: float
 
 
+class StageAxis(enum.Enum):
+    """An axis of the stage."""
+
+    X = "x"
+    Y = "y"
+    Z = "z"
+
+
+@dataclasses.dataclass
+class AxisLimit:
+    """
+    The positions the stage is allowed to move to along one axis.
+
+    Attributes:
+      Axis: The limited axis.
+      Minimum: Lowest allowed position.
+      Maximum: Highest allowed position.
+    """
+
+    axis: StageAxis
+    minimum: typing.Annotated[int, STEP]
+    maximum: typing.Annotated[int, STEP]
+
+
+@dataclasses.dataclass
+class Annotation:
+    """
+    A key/value note stored with a capture, e.g. a sample identifier or an experiment step.
+
+    Attributes:
+      Key: Name of the note; unique within one capture.
+      Value: Text of the note.
+    """
+
+    key: typing.Annotated[str, constraints.MinimalLength(1)]
+    value: str
+
+
 @dataclasses.dataclass
 class CaptureInfo:
     """
@@ -104,6 +144,7 @@ class CaptureInfo:
       Time: Capture time as reported by the server (ISO 8601).
       Format: Image format, e.g. `jpeg`.
       Tags: Tags attached to the capture.
+      Annotations: Key/value notes stored with the capture.
     """
 
     id: str
@@ -112,18 +153,25 @@ class CaptureInfo:
     time: str
     format: str
     tags: list[str]
+    annotations: list[Annotation] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, data: collections.abc.Mapping[str, object]) -> "CaptureInfo":
         """Build a record from a v2 `Capture` object; `id` and `name` are required, the rest default to empty."""
-        tags = data.get("tags") or []
+        tags = data.get("tags")
+        annotations = data.get("annotations")
         return cls(
             id=str(data["id"]),
             name=str(data["name"]),
             path=str(data.get("path") or ""),
             time=str(data.get("time") or ""),
             format=str(data.get("format") or ""),
-            tags=[str(tag) for tag in tags],  # type: ignore[union-attr]
+            tags=[str(tag) for tag in tags] if isinstance(tags, (list, tuple)) else [],
+            annotations=(
+                [Annotation(key=str(key), value=str(value)) for key, value in annotations.items()]
+                if isinstance(annotations, collections.abc.Mapping)
+                else []
+            ),
         )
 
 

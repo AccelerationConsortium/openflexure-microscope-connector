@@ -21,6 +21,7 @@ def test_feature_metadata(feature):
     assert feature.attach() is True
     assert set(feature.commands) == {"RunFastAutofocus", "RunAutofocus", "MeasureSharpness", "Stop"}
     assert feature.properties == {}
+    assert "TravelLimitExceededError" in feature.commands["RunFastAutofocus"].errors
     assert feature.commands["RunFastAutofocus"].observable is True
     assert feature.commands["RunAutofocus"].observable is True
     assert feature.commands["RunFastAutofocus"].execution_mode == sila.ExecutionMode.SINGLE

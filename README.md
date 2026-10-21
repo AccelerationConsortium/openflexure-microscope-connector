@@ -16,7 +16,9 @@ Version 0.1.0, not yet released.
 - **Verified on a real microscope** (server 2.11.0, Raspberry Pi camera v2, 2026-10-21): identity and status, camera
   settings, preview and full-resolution images, stored captures (create, list, download, tag, delete), sharpness
   measurement, simulation/real mode switching, and the defined errors for unavailable hardware. It was driven over SiLA
-  and from UniteLabs Ground Control.
+  and from UniteLabs Ground Control. Capture annotations, `ExportCapture` and the travel-limit refusals were checked
+  over SiLA on the same microscope with the current code. Its backlash setting is 0 and the stage was detached, so the
+  backlash-overshoot check, the one-at-a-time rule and Stop during a move are so far tested in simulation only.
 - **Not yet verified on hardware:** stage motion, `StageController.Stop`, autofocus (`RunFastAutofocus`,
   `RunAutofocus`, `AutofocusController.Stop`) and the server's busy/error responses. The test microscope's motors were
   detached, so the connector correctly refused these commands.
@@ -26,9 +28,9 @@ Version 0.1.0, not yet released.
 
 | SiLA feature | Commands | Properties | OpenFlexure v2 endpoints |
 |---|---|---|---|
-| `StageController` | `MoveTo`*, `MoveBy`*, `SetZeroPosition`, `Stop` | `Position`, `LivePosition`†, `StageType`, `Backlash` | `actions/stage/move`, `actions/stage/zero`, `instrument/state/stage/position` |
+| `StageController` | `MoveTo`*, `MoveBy`*, `SetZeroPosition`, `Stop` | `Position`, `LivePosition`†, `StageType`, `Backlash`, `TravelLimits` | `actions/stage/move`, `actions/stage/zero`, `instrument/state/stage/position` |
 | `ImageAcquisitionController` | `GrabPreviewFrame`, `AcquireImage`*, `CaptureToStorage`* | `MJPEGStreamURL` | `streams/snapshot`, `actions/camera/ram-capture`, `actions/camera/capture` |
-| `CaptureStorageService` | `DownloadCapture`, `DownloadThumbnail`, `ReadCaptureMetadata`, `SetCaptureTags`, `DeleteCapture` | `Captures` | `captures`, `captures/{id}`, `captures/{id}/download/{name}`, `captures/{id}/tags` |
+| `CaptureStorageService` | `DownloadCapture`, `DownloadThumbnail`, `ReadCaptureMetadata`, `SetCaptureTags`, `DeleteCapture`, `ExportCapture` | `Captures`, `ExportFolder` | `captures`, `captures/{id}`, `captures/{id}/download/{name}`, `captures/{id}/tags` |
 | `CameraController` | `SetExposureTime`, `SetAnalogGain`, `SetWhiteBalanceGains`, `SetDigitalGain`‡, `SetExposureMode`‡, `SetWhiteBalanceMode`‡, `SetJPEGQuality`‡ | `ExposureTime`, `AnalogGain`, `WhiteBalanceGains`, `StreamResolution`, `ImageResolution`, `DigitalGain`‡, `ExposureMode`‡, `WhiteBalanceMode`‡, `JPEGQuality`‡ | `instrument/settings/camera/...` |
 | `AutofocusController` | `RunFastAutofocus`*, `RunAutofocus`*, `MeasureSharpness`, `Stop` | — | `extensions/org.openflexure.autofocus/{fast_autofocus,autofocus,measure_sharpness}` |
 | `MicroscopeProvider` | — | `MicroscopeName`, `MicroscopeId`, `ServerVersion`, `CameraType`, `InstalledExtensions`, `APIBaseURL`, `Reachable`† | `instrument/configuration`, `instrument/settings`, `extensions` |
@@ -49,11 +51,52 @@ Conventions on the SiLA interface:
   or `missing stage`.
 - The SiLA 2 base protocol has no cancel call, and this connector does not implement the optional `CancelController`
   feature, so a client cannot abort the command it started. Use `StageController.Stop` or `AutofocusController.Stop`
-  instead: they cancel the running action on the microscope, and the cancelled command finishes with a
-  `MoveFailedError` / `AutofocusFailedError` that says so.
+  instead: they cancel the running action on the microscope, and also stop a move or autofocus that has not reached
+  the microscope yet (it is still reading the stage, or waiting for a previous one). The stopped command finishes with
+  a `MoveFailedError` / `AutofocusFailedError` that says so, and `Stop` returns once it has ended (at most about 2 s),
+  so the same command can be sent again straight away. `StoppedOperations` counts only what the microscope actually
+  cancelled: an action whose cancellation fails (no answer, or an HTTP error) keeps running, stays tracked, and the
+  next `Stop` tries again.
 - Every failure is a *Defined Execution Error* with an actionable message (`MicroscopeUnreachableError`,
   `StageUnavailableError`, `StageBusyError`, `MoveFailedError`, `CameraUnavailableError`, `CaptureFailedError`,
-  `CaptureNotFoundError`, `CameraSettingUnsupportedError`, `AutofocusUnavailableError`, `AutofocusFailedError`).
+  `CaptureNotFoundError`, `CameraSettingUnsupportedError`, `AutofocusUnavailableError`, `AutofocusFailedError`,
+  `TravelLimitExceededError`, `ZeroPositionBlockedError`, `ExportFailedError`).
+
+### Travel limits, annotations and exporting images
+
+- **Travel limits.** The OpenFlexure stage has no limit switches. Set `stage_{x,y,z}_min` and `stage_{x,y,z}_max`
+  in `config.json` (motor steps, both bounds of an axis together) and the connector refuses any `MoveTo`, `MoveBy`,
+  `RunFastAutofocus` or `RunAutofocus` that would leave the range, with `TravelLimitExceededError`, before any move
+  is sent to the microscope (it reads the stage position and backlash first). `StageController.TravelLimits` lists
+  the limited axes (empty when none are set).
+  - Only the axes a move changes are checked, so an axis that is already outside its range does not block moves of
+    the others; move it back inside with a `MoveTo` or `MoveBy` that ends inside the range.
+  - The stage's backlash correction counts too: moving against the sign of the `Backlash` setting first overshoots
+    the target by that many steps, and that overshoot must stay inside the limits. The slow `RunAutofocus` always
+    corrects 256 steps of backlash (the server forces it), so its sweep is checked 256 steps further down. A fast
+    autofocus is checked as a sweep of `ZRange` steps centred on the current z (it corrects no backlash). The
+    overshoot check follows the standard Sanga stage. A delta stage corrects backlash per motor, so its overshoot
+    cannot be checked: while limits are set on a delta stage, moves are refused unless its `Backlash` is 0, and the
+    slow `RunAutofocus` is refused (use `RunFastAutofocus`).
+  - Moves are sent to the microscope as absolute targets for the axes that change, so the end point stays inside
+    the limits even if the stage was moved elsewhere after the connector read its position, once that other move has
+    finished. While limits are set, the connector runs its own moves and autofocus runs one at a time: a second one
+    waits up to 1 s for the first to finish (enough for one that was just stopped), then fails with `StageBusyError`.
+  - The limits are positions in the stage's current coordinates, so `SetZeroPosition` is refused with
+    `ZeroPositionBlockedError` while any limit is configured. Zeroing from the microscope's web interface or power
+    cycling the Sangaboard also resets the coordinates and shifts the protected range with them.
+  - The limits only cover moves made through this connector. Moves from the microscope's web interface or other
+    programs are not checked, and while one of those is running at the same time, neither the end point nor the
+    backlash overshoot of a move from the connector is guaranteed.
+- **Annotations.** `CaptureToStorage` takes an `Annotations` list of `Key`/`Value` pairs (may be empty; keys must
+  be non-empty and unique). They are stored with the capture on the microscope and reported in `Captures`.
+- **Exporting.** `CaptureStorageService.ExportCapture` saves a stored capture as a JPEG file in
+  `CaptureStorageService.ExportFolder` on the computer running the connector, and returns the saved path. The file
+  keeps the capture's name, made safe for Windows, macOS and Linux: invalid characters are replaced with `_`,
+  leading and trailing dots and spaces are removed (no hidden files), `.jpeg` is added unless the name ends in
+  `.jpeg` or `.jpg`, long names are shortened and reserved device names get a `_` prefix. An existing file or folder
+  is never overwritten (`name (1).jpeg`, `name (2).jpeg`, … instead).
+  `DownloadCapture` still returns the image bytes to the client.
 
 ## Getting started
 
@@ -90,7 +133,11 @@ uv run python scripts/smoke_client.py --port <port> --move-z 20  # also move the
 
 ### Connect to the real microscope
 
-Edit `config.json` (a complete example is in [`config/openflexure_config.example.json`](config/openflexure_config.example.json)):
+Edit the `config.json` that `config create` wrote: it holds this installation's own `sila_server.uuid`, its
+identity in Ground Control. [`config/openflexure_config.example.json`](config/openflexure_config.example.json) shows
+every key but has no `uuid`. If you copy it instead, add a `"uuid"` under `sila_server` (for example from
+`python -c "import uuid; print(uuid.uuid4())"`), or the connector gets a new identity on every start. The keys to
+change:
 
 ```json
 {
@@ -117,11 +164,32 @@ is still running (stop it first).
 | `request_timeout_s` | `10.0` | Timeout of a single HTTP request. |
 | `action_poll_interval_s` | `0.25` | Poll interval for long-running server actions (move, capture, autofocus). |
 | `position_poll_interval_s` | `0.5` | Poll interval behind the `LivePosition` subscription. |
+| `stage_x_min` / `stage_x_max`, `stage_y_min` / `stage_y_max`, `stage_z_min` / `stage_z_max` | `null` | Software travel limits in motor steps; set both bounds of an axis or neither. `null` means the axis is not limited. |
+| `export_folder` | `~/Downloads/OpenFlexure` | Folder where `ExportCapture` saves images, on the computer running the connector; created when needed. `~` is the home folder of the user running the connector, and a relative path is relative to the folder the connector was started from. Must not be empty. |
+| `discovery.network_interfaces` | `null` | IPv4 addresses the connector announces itself on for discovery in Ground Control. Left `null`, the connector picks them at each start (see below). A list is used as given; `[]` lets the operating system pick one interface. |
 | `sila_server`, `cloud_servers`, `discovery`, `logging` | CDK defaults | Standard UniteLabs settings (local port, UniteLabs cloud endpoints, mDNS, logging). |
 
 Set `sila_server.port` to a fixed value (e.g. `50052`) for a stable local endpoint. To register the connector with the
 UniteLabs platform, add your tenant's cloud endpoint under `cloud_servers.endpoints` (not yet tried with this connector).
 Each installation generates its own `sila_server.uuid`; keep it stable once the connector is registered.
+
+**Discovery on the lab network.** Ground Control finds connectors through mDNS announcements. Left to itself, the
+SiLA library sends them through one interface the operating system picks, and Windows often picks a virtual adapter
+(Tailscale or another VPN, WSL, Docker Desktop): the connector then shows up only in Ground Control on the same
+computer. So when `discovery.network_interfaces` is `null`, the connector announces on the default route's address
+and the other IPv4 addresses the operating system reports for the computer's name (loopback and `169.254.x.x`
+addresses are skipped), and logs them at startup (`Announcing the connector for discovery on ...`).
+
+- On Windows the list can include virtual adapters such as WSL's. Announcing there is harmless, and an error logged
+  for one address does not mean the others failed. On Linux usually only the default route's address is used, so a
+  computer on two lab networks should list its addresses in `discovery.network_interfaces`.
+- The addresses are looked up at each start and never written to `config.json`, but they are fixed while the
+  connector runs. After the computer gets a new address (a new DHCP lease, another network), discovery goes quiet
+  until the connector restarts. With no network connection at start, the connector logs a warning and the operating
+  system keeps choosing; restart it once the network is up. For an always-on installation, reserve the address on
+  the router or set `discovery.network_interfaces`.
+- Ground Control on Windows can have the same problem with its own discovery queries, so a connector that started
+  before Ground Control may only appear after the connector restarts.
 
 ## Testing
 
@@ -150,6 +218,11 @@ docker compose up --build
 
 `docker-compose.yml` uses host networking so mDNS discovery and `microscope.local` work; that requires a Linux Docker
 host. On Docker Desktop (Windows/macOS) publish the SiLA port instead and set `host` to the microscope's IP address.
+
+`ExportCapture` saves into the container's `~/Downloads/OpenFlexure` (`/root/Downloads/OpenFlexure`) by default.
+`docker-compose.yml` mounts the `exports` folder next to it there, so exported images appear in `./exports` on the host
+and survive rebuilding the container. If you set `export_folder` in the container's `config.json`, mount that folder
+instead; `ExportFolder` and `SavedPath` report paths inside the container.
 
 ## Limitations and roadmap
 
@@ -191,4 +264,4 @@ template (`.cruft.json`) and depends only on PyPI packages (`unitelabs-cdk`, `ht
 
 ## Contact
 
-Issues: https://github.com/AccelerationConsortium/openflexure-microscope/issues
+Issues: https://github.com/AccelerationConsortium/openflexure-microscope-connector/issues

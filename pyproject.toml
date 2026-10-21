@@ -28,9 +28,9 @@ dependencies=[
 ]
 
 [project.urls]
-repository = "https://github.com/AccelerationConsortium/openflexure-microscope"
-documentation = "https://github.com/AccelerationConsortium/openflexure-microscope/blob/main/README.md"
-"Bug Tracker" = "https://github.com/AccelerationConsortium/openflexure-microscope/issues"
+repository = "https://github.com/AccelerationConsortium/openflexure-microscope-connector"
+documentation = "https://github.com/AccelerationConsortium/openflexure-microscope-connector/blob/main/README.md"
+"Bug Tracker" = "https://github.com/AccelerationConsortium/openflexure-microscope-connector/issues"
 
 [project.optional-dependencies]
 test = [
@@ -108,8 +108,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# ignore documentation, typing, and assertions in tests
-"!src/**.py" = ["D", "ANN", "ARG", "S101", "EM", "A005"]
+# ignore documentation, typing, assertions and small blocking file reads in tests
+"!src/**.py" = ["D", "ANN", "ARG", "S101", "EM", "A005", "ASYNC240"]
 # the smoke client is a CLI script that prints its findings
 "scripts/**.py" = ["T201"]
 # ignore parameter name warnings in feature files

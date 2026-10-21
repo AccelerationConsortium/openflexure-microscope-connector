@@ -12,6 +12,8 @@ import typing
 
 from unitelabs.cdk.config import ConfigurationError
 
+from .limits import TravelLimits
+
 from .types import (
     Backlash,
     CaptureInfo,
@@ -55,6 +57,8 @@ class MicroscopeApi(abc.ABC):
     """
 
     capabilities: frozenset[Capability] = frozenset()
+    travel_limits: TravelLimits = TravelLimits()
+    """Stage travel limits enforced by `move`, `fast_autofocus` and `autofocus_sweep` (none by default)."""
 
     def supports(self, capability: Capability) -> bool:
         """Whether this implementation provides the given optional capability."""
@@ -223,14 +227,20 @@ class MicroscopeApi(abc.ABC):
         tags: collections.abc.Sequence[str],
         resolution: CaptureResolution,
         on_progress: ProgressCallback | None = None,
+        *,
+        annotations: collections.abc.Mapping[str, str] | None = None,
     ) -> CaptureInfo:
-        """Capture an image into the microscope's storage and describe the stored capture."""
+        """Capture an image into the microscope's storage, with optional key/value annotations, and describe it."""
 
     # -- capture storage -----------------------------------------------------------------------------------------
 
     @abc.abstractmethod
     async def list_captures(self) -> list[CaptureInfo]:
         """List the captures stored on the microscope."""
+
+    @abc.abstractmethod
+    async def get_capture(self, capture_id: str) -> CaptureInfo:
+        """Describe one stored capture; raises `CaptureNotFoundError` if it does not exist."""
 
     @abc.abstractmethod
     async def download_capture(self, capture_id: str, *, thumbnail: bool = False) -> bytes:
