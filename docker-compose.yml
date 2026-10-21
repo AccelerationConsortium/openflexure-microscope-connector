@@ -1,0 +1,14 @@
+services:
+  openflexure-microscope:
+    build: .
+    restart: always
+    # Host networking lets the connector be discovered via mDNS on the LAN and resolve `microscope.local`.
+    # It only works on a Linux Docker host; on Docker Desktop (Windows/macOS) publish the SiLA port instead
+    # and set `host` in config.json to the microscope's IP address.
+    network_mode: host
+    volumes:
+      - type: bind
+        source: ./config.json
+        target: /app/config.json
+        read_only: true
+    command: ["connector", "start", "--app", "unitelabs.openflexure_microscope:create_app", "-cfg", "/app/config.json"]

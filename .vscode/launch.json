@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Connector start",
+      "type": "debugpy",
+      "request": "launch",
+      "purpose": ["debug-test"],
+      "program": "${workspaceFolder}/.venv/bin/connector",
+      "console": "integratedTerminal",
+      "args": ["start", "--app", "unitelabs.openflexure_microscope:create_app"],
+      "windows": {
+        "program": "${workspaceFolder}/.venv/Scripts/python.exe",
+        "args": [
+          "-c",
+          "from unitelabs.cdk.cli import connector; connector()",
+          "start",
+          "--app",
+          "unitelabs.openflexure_microscope:create_app"
+        ]
+      }
+    },
+    {
+      "name": "Python: Debug Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "purpose": ["debug-test"],
+      "console": "internalConsole",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      },
+      "justMyCode": false,
+      "presentation": {
+        "hidden": true
+      }
+    }
+  ]
+}

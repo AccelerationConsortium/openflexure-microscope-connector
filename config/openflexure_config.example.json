@@ -1,0 +1,34 @@
+{
+  "sila_server": {
+    "hostname": "0.0.0.0",
+    "port": 0,
+    "tls": false,
+    "require_client_auth": false,
+    "root_certificates": null,
+    "certificate_chain": null,
+    "private_key": null,
+    "options": {},
+    "name": "OpenFlexure Microscope",
+    "type": "Microscope",
+    "description": "SiLA 2 connector for the OpenFlexure Microscope (server v2 HTTP API).",
+    "vendor_url": "https://openflexure.org/",
+    "default_lifetime": 3600.0
+  },
+  "cloud_servers": {
+    "enabled": true,
+    "endpoints": []
+  },
+  "discovery": {
+    "ip_version": "ipv4",
+    "network_interfaces": null,
+    "certificate": null
+  },
+  "logging": null,
+  "simulation_mode": true,
+  "api_version": "v2",
+  "host": "microscope.local",
+  "port": 5000,
+  "request_timeout_s": 10.0,
+  "action_poll_interval_s": 0.25,
+  "position_poll_interval_s": 0.5
+}

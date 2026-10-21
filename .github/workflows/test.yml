@@ -1,0 +1,50 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    env:
+      # Every uv call in this job uses the matrix interpreter (otherwise .python-version would win).
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --locked
+
+      - name: Lint
+        run: uv run ruff check src tests scripts
+
+      - name: Format check
+        run: uv run ruff format --check src tests scripts
+
+      - name: Test (unit, simulated backend, gRPC round trips)
+        run: uv run pytest --cov=src --cov-report=term --cov-report=xml
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
